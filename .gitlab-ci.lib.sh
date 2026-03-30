@@ -102,11 +102,38 @@ define_util_core() {
     popd
     do_print_trace "$(do_stack_trace)" "${_dir}" 'Done'
   }
+  # Copy files between directories on the same host.
+  do_dir_cp() {
+    local _local_dir="${1}"
+    local _remote_dir="${2}"
+    local _hook_do="${3}"
+    do_dir_make "${_remote_dir}"
+    do_dir_list "${_local_dir:?}"
+    if [ "${_local_dir}" = "${_remote_dir}" ]; then
+      do_print_trace "# same path, skip copy"
+    else
+      if ! cp -rp "${_local_dir}/"* "${_remote_dir:?}/"; then
+        do_print_warn "cp to ${_remote_dir:?}/ failed"
+        return 9
+      fi
+      do_print_trace "cp to ${_remote_dir} (local)" "$(date +'%T')"
+    fi
+    if [ "$(type -t "${_hook_do}")" = function ]; then
+      "${_hook_do}" "${@:4}"
+      local _status="${?}"
+      [ "${_status}" -ne 0 ] && return "${_status}"
+    fi
+  }
   do_dir_scp() {
     local _local_dir="${1}"
     local _remote_dir="${2}"
     local _user_host="${3}"
     local _hook_do="${4}"
+    # Same host: delegate to local copy
+    if [ 'yes' = "${_DEPLOY_SAME_HOST}" ]; then
+      do_dir_cp "${_local_dir}" "${_remote_dir}" "${_hook_do}" "${@:5}"
+      return
+    fi
     do_ssh_export_clear
     do_ssh_export do_print_trace do_print_warn do_print_colorful
     do_ssh_invoke "$(do_ssh_exec_chain "${_user_host:?}")" do_dir_make "'${_remote_dir}'"
@@ -134,13 +161,22 @@ define_util_core() {
     [ ! -f "${1}" ] && touch "${1}" && chmod -f 600 "${1}" && ls -lh "${1}"
     local _status
     set +e +o pipefail
-    diff --unchanged-line-format='' \
-      --old-line-format="- |%2dn| %L" \
-      --new-line-format="+ |%2dn| %L" "${1}" "${2}" |
-      awk 'BEGIN{FIELDWIDTHS="1"} { if ($1 == "+") {
-      printf "\033[0;32m%s\033[0m\n", $0 } else {
-      printf "\033[0;31m%s\033[0m\n", $0 } }'
-    _status=${PIPESTATUS[0]}
+    # GNU diff supports --line-format; BSD diff (macOS) does not
+    if diff --unchanged-line-format='' /dev/null /dev/null 2>/dev/null; then
+      diff --unchanged-line-format='' \
+        --old-line-format="- |%2dn| %L" \
+        --new-line-format="+ |%2dn| %L" "${1}" "${2}" |
+        awk 'BEGIN{FIELDWIDTHS="1"} { if ($1 == "+") {
+        printf "\033[0;32m%s\033[0m\n", $0 } else {
+        printf "\033[0;31m%s\033[0m\n", $0 } }'
+      _status=${PIPESTATUS[0]}
+    else
+      diff -u "${1}" "${2}" |
+        awk '{ if (/^+/) { printf "\033[0;32m%s\033[0m\n", $0 }
+        else if (/^-/) { printf "\033[0;31m%s\033[0m\n", $0 }
+        else { print } }'
+      _status=${PIPESTATUS[0]}
+    fi
     set -o pipefail
     return "${_status}"
   }
@@ -236,6 +272,13 @@ define_util_core() {
     done
     _replace "$open_char" "$close_char"
   }
+  do_sed_i() { # macOS/Linux 兼容的 sed -i
+    if [[ "$(uname -s)" = "Darwin" ]]; then
+      sed -i '' "${@}"
+    else
+      sed -i "${@}"
+    fi
+  }
   do_file_replace() {
     local _path="${1}" name
     [ ! -f "${_path:?}" ] && {
@@ -243,7 +286,7 @@ define_util_core() {
       return
     }
     for name in "${@:2}"; do
-      sed -i -e "s|#${name}|${!name}|g" "${_path}"
+      do_sed_i -e "s|#${name}|${!name}|g" "${_path}"
     done
   }
   do_write_file() {
@@ -304,16 +347,23 @@ define_util_ssh() {
   do_ssh_exec_chain() {
     if [ 1 -gt ${#@} ]; then return; fi
     local _ssh='ssh -o ConnectTimeout=3 -T'
-    local _chain
+    local _chain _prev=""
     printf -v _chain '%s %s' "${_ssh}" "${1:?}"
+    _prev="${1}"
     for i in "${@:2}"; do
+      # skip duplicate hop: when adjacent hosts are the same user@host
+      [ "${i}" = "${_prev}" ] && continue
       printf -v _chain '%s -- %s %s' "${_chain}" "${_ssh}" "${i}"
+      _prev="${i}"
     done
     printf '%s' "${_chain}"
   }
   do_ssh_exec() {
     local _ssh="${1}"
     local _command="${*:2}"
+    # Ensure remote PATH includes common binary locations (macOS compatibility)
+    local _path_init='[ -x /usr/libexec/path_helper ] && eval "$(/usr/libexec/path_helper -s)"'
+    printf -v _command '%s\n%s' "${_path_init}" "${_command}"
     if [ -n "${OPTION_DEBUG}" ]; then
       printf -v _command '%s\n%s' "$(declare -p OPTION_DEBUG)" "${_command}"
     fi
@@ -325,7 +375,11 @@ define_util_ssh() {
     done
     do_print_debug "${_command} | ${_ssh:?} -- /bin/bash -eo pipefail -s -"
     set +e
-    /bin/echo "${_command}" | ${_ssh} -- /bin/bash -eo pipefail -s -
+    if [ "${_ssh}" = '_LOCAL' ]; then
+      /bin/echo "${_command}" | /bin/bash -eo pipefail -s -
+    else
+      /bin/echo "${_command}" | ${_ssh} -- /bin/bash -eo pipefail -s -
+    fi
   }
   do_ssh_exec_here() {
     local _ssh, _input
@@ -376,7 +430,18 @@ define_util_ssh() {
     ARG_SSH_KNOWN_HOSTS="${JUMPER_SSH_KNOWN_HOSTS:=${SSH_KNOWN_HOSTS}}"
     do_ssh_add_user
     UPLOAD_USER="${UPLOAD_SSH_USER:-${ARG_SSH_USER}}"
+    UPLOAD_USER_HOST="${UPLOAD_USER}@${JUMPER_SSH_HOST}"
     JUMPER_USER_HOST="${DEPLOY_SSH_USER}@${JUMPER_SSH_HOST}"
+  }
+  do_scp_to_jumper() {
+    local _local_file="${1:?}"
+    local _remote_path="${2:?}"
+    local _mode="${3:-440}"
+    do_ssh_jumper_exec "[ -f '${_remote_path}' ] && chmod u+w '${_remote_path}' || true"
+    scp -pC -o StrictHostKeyChecking=no \
+      "${_local_file}" "${UPLOAD_USER_HOST:?}:${_remote_path}"
+    do_ssh_jumper_exec "chmod ${_mode} '${_remote_path}'"
+    do_print_info "- scp: $(basename "${_local_file}") → ${UPLOAD_USER_HOST}:${_remote_path}"
   }
   do_ssh_agent_init() {
     do_print_info "$(do_stack_trace)"
@@ -447,7 +512,29 @@ define_util_ssh() {
     do_print_dash_pair 'SERVICE_HOST' "${SERVICE_HOST}"
     set +e
     SERVICE_USER_HOST="${SERVICE_USER}@${SERVICE_HOST}"
-    [ -z "${CONTAINER_WORK_DIR}" ] && CONTAINER_WORK_DIR="/home/${SERVICE_USER}"
+    SERVICE_BASE_DIR="${SERVICE_BASE_DIR:-${HOME_BASE_DIR:-/home}/${SERVICE_USER}}"
+    UPLOAD_BASE_DIR="${UPLOAD_BASE_DIR:-${HOME_BASE_DIR:-/home}/${UPLOAD_USER}}"
+    [ -z "${CONTAINER_WORK_DIR}" ] && CONTAINER_WORK_DIR="${SERVICE_BASE_DIR}"
+    # Detect two-layer topology: jumper and service are the same host
+    if [ "${JUMPER_SSH_HOST}" = "${SERVICE_HOST}" ]; then
+      _DEPLOY_SAME_HOST='yes'
+      # Two-layer: Runner → Service directly (skip jumper→service hop)
+      do_ssh_server_invoke() {
+        do_ssh_invoke "$(do_ssh_exec_chain "${SERVICE_USER_HOST:?}")" "${@}"
+      }
+      do_ssh_server_exec() {
+        do_ssh_exec "$(do_ssh_exec_chain "${SERVICE_USER_HOST:?}")" "${@}"
+      }
+    else
+      _DEPLOY_SAME_HOST=''
+      # Three-layer: Runner → Jumper → Service (default)
+      do_ssh_server_invoke() {
+        do_ssh_invoke "$(do_ssh_exec_chain "${JUMPER_USER_HOST:?}" "${SERVICE_USER_HOST:?}")" "${@}"
+      }
+      do_ssh_server_exec() {
+        do_ssh_exec "$(do_ssh_exec_chain "${JUMPER_USER_HOST:?}" "${SERVICE_USER_HOST:?}")" "${@}"
+      }
+    fi
     set -e
   }
   _service_ssh_variable() {
@@ -653,6 +740,54 @@ define_util_vault() {
     do_print_info "- fetch from vault - ${_line_count} line(s) - ${#_command} char(s)"
     eval "${_command}"
   }
+  do_vault_render_template() {
+    local _template="${1:?}"
+    local _output="${2:?}"
+    local _vault_path="${3}"
+
+    do_print_info "VAULT RENDER" "[${_template}]"
+
+    local _env_data
+    _env_data="$(do_vault_service_env_file "${_vault_path}")"
+  #    do_print_info "$_env_data"
+    if [ -z "${_env_data}" ]; then
+      do_print_warn "- vault render: no data from '${_vault_path:-${SERVICE_GROUP}-env}'"
+      return 1
+    fi
+
+    local _line_count
+    _line_count=$(echo "${_env_data}" | wc -l | xargs)
+    do_print_info "- vault render: fetched ${_line_count} variable(s)"
+
+    # Build sed script file (avoids shell argument length limits and newline issues)
+    local _sed_script
+    _sed_script=$(mktemp)
+    local _count=0
+    while IFS= read -r _line; do
+      [ -z "${_line}" ] && continue
+      local _key="${_line%%=*}"
+      local _value="${_line#*=}"
+      [ -z "${_key}" ] && continue
+      # Skip lines that don't look like KEY=VALUE (e.g. error messages)
+      [[ "${_key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+      _value="${_value//\\/\\\\}"
+      _value="${_value//|/\\|}"
+      _value="${_value//&/\\&}"
+      _value="${_value//$'\n'/\\n}"
+      echo "s|<\$${_key}>|${_value}|g" >> "${_sed_script}"
+      _count=$((_count + 1))
+    done <<< "${_env_data}"
+
+    if [ "${_count}" -eq 0 ]; then
+      do_print_warn "- vault render: no valid variables parsed"
+      rm -f "${_sed_script}"
+      return 1
+    fi
+
+    sed -f "${_sed_script}" "${_template}" > "${_output}"
+    rm -f "${_sed_script}"
+    do_print_info "- vault render: ${_template} → ${_output}"
+  }
 }
 
 define_util_print() {
@@ -745,6 +880,7 @@ define_common_init() {
   define_util_core
   define_util_print
   define_util_vault
+  define_util_container
   define_common_ci_job
   init_first_do() {
     do_func_invoke 'init_first_custom_do'
@@ -767,7 +903,10 @@ define_common_init() {
     PROJECT_VAULT_USER="$(do_print_variable "${_prefix}" 'VAULT_USER' "${_suffix}")"
     PROJECT_VAULT_PASS="$(do_print_variable "${_prefix}" 'VAULT_PASS' "${_suffix}")"
     PROJECT_VAULT_URL="$(do_print_variable "${_prefix}" 'VAULT_URL' "${_suffix}")"
-    PROJECT_VAULT_PATH="${CUSTOMER:?}-${ENV_NAME:?}/data/project"
+    local _kv_mount
+    _kv_mount="$(do_print_variable "${_prefix}" 'VAULT_KV_MOUNT' "${_suffix}")"
+    _kv_mount="${_kv_mount:-${VAULT_KV_MOUNT:-secret}}"
+    PROJECT_VAULT_PATH="${_kv_mount}/data/${CUSTOMER:?}-${ENV_NAME:?}/project"
   }
   init_service_vault_do() {
     local _prefix='SERVICE_'
@@ -776,7 +915,10 @@ define_common_init() {
     SERVICE_VAULT_USER="$(do_print_variable "${_prefix}" 'VAULT_USER' "${_suffix}")"
     SERVICE_VAULT_PASS="$(do_print_variable "${_prefix}" 'VAULT_PASS' "${_suffix}")"
     SERVICE_VAULT_URL="$(do_print_variable "${_prefix}" 'VAULT_URL' "${_suffix}")"
-    SERVICE_VAULT_PATH="${CUSTOMER:?}-${ENV_NAME:?}/data/service"
+    local _kv_mount
+    _kv_mount="$(do_print_variable "${_prefix}" 'VAULT_KV_MOUNT' "${_suffix}")"
+    _kv_mount="${_kv_mount:-${VAULT_KV_MOUNT:-secret}}"
+    SERVICE_VAULT_PATH="${_kv_mount}/data/${CUSTOMER:?}-${ENV_NAME:?}/service"
   }
   init_inject_env_bash_do() {
     [ 'yes' = "${OPTION_VAULT_DISABLED}" ] && return 0
@@ -894,7 +1036,7 @@ define_common_upload() {
     SERVICE_GROUP="${2:-${SERVICE_GROUP:?}}"
     [ -z "${RUNNER_LOCAL_DIR}" ] && do_upload_cleanup_local
     local _local_dir="${RUNNER_LOCAL_DIR:?}"
-    local _remote_dir="/home/${UPLOAD_USER:?}/${SERVICE_GROUP:?}/${SERVICE_NAME:?}-${CD_VERSION_TAG:?}"
+    local _remote_dir="${UPLOAD_BASE_DIR:-${HOME_BASE_DIR:-/home}/${UPLOAD_USER:?}}/${SERVICE_GROUP:?}/${SERVICE_NAME:?}-${CD_VERSION_TAG:?}"
     upload_cd_version_file_do "${_local_dir}" "${VERSION_BUILDING:-0}"
     upload_scp_do "${_local_dir}" "${_remote_dir}"
     do_print_info 'UPLOAD SERVICE DONE' "[${2}::${1}]"
@@ -904,7 +1046,7 @@ define_common_upload() {
     SERVICE_GROUP="${1:-${SERVICE_GROUP:?}}"
     [ -z "${RUNNER_LOCAL_DIR}" ] && do_upload_cleanup_local
     local _local_dir="${RUNNER_LOCAL_DIR:?}"
-    local _remote_dir="/home/${UPLOAD_USER:?}/${SERVICE_GROUP:?}/env-deploy"
+    local _remote_dir="${UPLOAD_BASE_DIR:-${HOME_BASE_DIR:-/home}/${UPLOAD_USER:?}}/${SERVICE_GROUP:?}/env-deploy"
     upload_scp_do "${_local_dir}" "${_remote_dir}"
     do_print_info 'UPLOAD SERVICE ENV DONE' "[${1}]"
   }
@@ -913,13 +1055,8 @@ define_common_upload() {
     local service=${1}
     local service_group=${2}
     local _dir="${CI_PROJECT_DIR:?}/deploy/${service_group:?}"
-    local _env_dir="${_dir}/env-deploy"
     local _service_dir="${_dir}/${service:?}"
     set +e
-    [ -d "${_env_dir}" ] && {
-      $_link "${_env_dir}/"* "${RUNNER_LOCAL_DIR}/"
-      do_upload_env "${service_group}"
-    }
     [ -d "${_service_dir}" ] && {
       $_link "${_service_dir}/"* "${RUNNER_LOCAL_DIR:?}/"
     }
@@ -994,11 +1131,11 @@ define_common_service() {
     do_print_dash_pair 'SERVICE_NAME' "${SERVICE_NAME:?}"
     do_print_dash_pair 'SERVICE_GROUP' "${SERVICE_GROUP:?}"
     do_print_dash_pair 'Common Variables'
-    SERVICE_GROUP_DIR="/home/${SERVICE_USER}/${SERVICE_GROUP}"
+    SERVICE_GROUP_DIR="${SERVICE_BASE_DIR:-${HOME_BASE_DIR:-/home}/${SERVICE_USER}}/${SERVICE_GROUP}"
     SERVICE_DIR="${SERVICE_GROUP_DIR}/${SERVICE_NAME}"
     SERVICE_LOCATION="${SERVICE_USER_HOST:?}:${SERVICE_DIR}"
     do_print_dash_pair 'SERVICE_LOCATION' "${SERVICE_LOCATION}"
-    SERVICE_UPLOAD_DIR="/home/${UPLOAD_USER:?}/${SERVICE_GROUP}/${SERVICE_NAME}-${CD_VERSION_TAG:?}"
+    SERVICE_UPLOAD_DIR="${UPLOAD_BASE_DIR:-${HOME_BASE_DIR:-/home}/${UPLOAD_USER:?}}/${SERVICE_GROUP}/${SERVICE_NAME}-${CD_VERSION_TAG:?}"
     SERVICE_DEPLOY_DIR="${SERVICE_DIR}-${CD_VERSION_TAG}"
     UPLOAD_LOCATION="${UPLOAD_USER}@${JUMPER_SSH_HOST}:${SERVICE_UPLOAD_DIR}"
     do_print_dash_pair 'UPLOAD_LOCATION' "${UPLOAD_LOCATION}"
@@ -1101,6 +1238,16 @@ define_common_verify() {
 
 define_common_deploy() {
   define_common_deploy_env
+  # Build SSH chain to service host, or return empty for same-host (local) exec.
+  # Used by deploy_service_do and deploy_env_do on the jumper.
+  # Returns SSH chain for service host, or '_LOCAL' sentinel for same-host exec.
+  _deploy_service_ssh() {
+    if [ 'yes' = "${_DEPLOY_SAME_HOST}" ]; then
+      printf '%s' '_LOCAL'
+    else
+      do_ssh_exec_chain "${SERVICE_USER_HOST:?}"
+    fi
+  }
   do_deploy() {
     do_print_info 'DEPLOY SERVICE'
     SERVICE_NAME="${1:-${SERVICE_NAME:?}}"
@@ -1178,12 +1325,12 @@ define_common_deploy() {
     [${CI_PIPELINE_IID:-CI_PIPELINE_ID} ${CI_JOB_ID}]"
     do_ssh_export_clear
     do_ssh_export do_print_trace do_print_warn do_print_colorful
-    do_ssh_export do_dir_make do_dir_list do_dir_chmod do_dir_scp do_write_log_file
+    do_ssh_export do_dir_make do_dir_list do_dir_chmod do_dir_scp do_dir_cp do_write_log_file
     do_ssh_export do_ssh_invoke do_ssh_exec do_ssh_exec_chain do_ssh_export do_ssh_export_clear
-    do_ssh_export service_container_stop_do
+    do_ssh_export _deploy_service_ssh service_container_stop_do
     do_ssh_export SERVICE_NAME SERVICE_USER_HOST SERVICE_UPLOAD_DIR SERVICE_DEPLOY_DIR SERVICE_DIR
     do_ssh_export SERVICE_STOP_WAIT
-    do_ssh_export _container_cmd _cd_log_line
+    do_ssh_export _container_cmd _cd_log_line _DEPLOY_SAME_HOST
     do_ssh_jumper_invoke deploy_service_do
     do_ssh_export_clear
   }
@@ -1192,7 +1339,9 @@ define_common_deploy() {
     do_ssh_export_clear
     do_ssh_export do_print_trace do_print_warn do_print_colorful
     do_ssh_export SERVICE_STOP_WAIT
-    do_ssh_invoke "$(do_ssh_exec_chain "${SERVICE_USER_HOST:?}")" \
+    local _service_ssh
+    _service_ssh="$(_deploy_service_ssh)"
+    do_ssh_invoke "${_service_ssh}" \
       service_container_stop_do "'${SERVICE_NAME:?}'" "'${_container_cmd}'"
     local _status=${?}
     set -e
@@ -1206,9 +1355,10 @@ define_common_deploy() {
     do_dir_scp_hook() {
       set +e
       do_dir_chmod "${_remote_dir}"
-      ln -sfn "${_remote_dir}" "${_remote_dir}/CD_LINK"
       do_dir_list "${_remote_dir}"
-      mv -Tf "${_remote_dir}/CD_LINK" "${1:?}"
+      # ln -sfn cannot replace a real directory — remove it first
+      [ -d "${1:?}" ] && [ ! -L "${1}" ] && rm -rf "${1}"
+      ln -sfn "${_remote_dir}" "${1:?}"
       set -e
     }
     export -f do_dir_scp_hook
@@ -1228,7 +1378,7 @@ define_common_deploy() {
       do_ssh_export_clear
       do_ssh_export do_print_trace do_print_warn do_print_colorful
       set +e
-      do_ssh_invoke "$(do_ssh_exec_chain "${SERVICE_USER_HOST:?}")" do_write_log_file "'${_path}'" "'${_cd_log_line:?}'"
+      do_ssh_invoke "$(_deploy_service_ssh)" do_write_log_file "'${_path}'" "'${_cd_log_line:?}'"
       local _status=${?}
       set -e
       case ${_status} in
@@ -1248,9 +1398,9 @@ define_common_deploy_env() {
     do_ssh_reset_service
     do_print_dash_pair 'SERVICE_GROUP' "${SERVICE_GROUP:?}"
     do_print_dash_pair 'UPLOAD_USER' "${UPLOAD_USER:?}"
-    SERVICE_GROUP_DIR="/home/${SERVICE_USER:?}/${SERVICE_GROUP:?}"
+    SERVICE_GROUP_DIR="${SERVICE_BASE_DIR:-${HOME_BASE_DIR:-/home}/${SERVICE_USER:?}}/${SERVICE_GROUP:?}"
     ENV_DEPLOY_DIR="${SERVICE_GROUP_DIR}/env-deploy"
-    local _local_dir="/home/${UPLOAD_USER}/${SERVICE_GROUP}/env-deploy"
+    local _local_dir="${UPLOAD_BASE_DIR:-${HOME_BASE_DIR:-/home}/${UPLOAD_USER}}/${SERVICE_GROUP}/env-deploy"
     local _remote_dir="${ENV_DEPLOY_DIR}"
     deploy_env_jumper_do "${_local_dir}" "${_remote_dir}"
     deploy_env_down_server_do "${_remote_dir}"
@@ -1259,7 +1409,7 @@ define_common_deploy_env() {
   do_deploy_env_up() {
     do_print_info 'DEPLOY SERVICE GROUP UP' "[${1}]"
     SERVICE_GROUP="${1:-${SERVICE_GROUP:?}}"
-    SERVICE_GROUP_DIR="/home/${SERVICE_USER:?}/${SERVICE_GROUP:?}"
+    SERVICE_GROUP_DIR="${SERVICE_BASE_DIR:-${HOME_BASE_DIR:-/home}/${SERVICE_USER:?}}/${SERVICE_GROUP:?}"
     ENV_DEPLOY_DIR="${SERVICE_GROUP_DIR}/env-deploy"
     do_ssh_reset_service
     do_ssh_export_clear
@@ -1279,22 +1429,24 @@ define_common_deploy_env() {
   deploy_env_up_do() {
     do_print_trace "$(do_stack_trace)"
     cd ~
-    [ -f '.bashrc' ] && source '.bashrc'
-    [ -f '.bash_profile' ] && source '.bash_profile'
     cd "${SERVICE_GROUP_DIR:?}"
     deploy_env_reset_do
     do_print_trace "# ${_compose_cmd:?} up -d"
     ${_compose_cmd} up -d
   }
   deploy_env_reset_do() {
-    if ! command -v podman-compose &>/dev/null; then
-      _compose_env_name='docker-compose.env'
-      _compose_yml_name='docker-compose.yml'
-      _compose_cmd="docker-compose --compatibility"
-    else
+    if command -v podman-compose &>/dev/null; then
       _compose_env_name='container-compose.env'
       _compose_yml_name='container-compose.yml'
       _compose_cmd="sudo podman-compose -f $_compose_yml_name"
+    else
+      _compose_env_name='docker-compose.env'
+      _compose_yml_name='docker-compose.yml'
+      if command -v docker-compose &>/dev/null; then
+        _compose_cmd="docker-compose --compatibility"
+      else
+        _compose_cmd="docker compose"
+      fi
     fi
     _compose_env_old="${SERVICE_GROUP_DIR:?}/.env"
     _compose_yml_old="${SERVICE_GROUP_DIR:?}/${_compose_yml_name}"
@@ -1304,9 +1456,9 @@ define_common_deploy_env() {
   deploy_env_jumper_do() {
     do_ssh_export_clear
     do_ssh_export do_print_trace do_print_warn do_print_colorful
-    do_ssh_export do_dir_make do_dir_list do_dir_chmod do_dir_scp
+    do_ssh_export do_dir_make do_dir_list do_dir_chmod do_dir_scp do_dir_cp
     do_ssh_export do_ssh_invoke do_ssh_exec do_ssh_exec_chain do_ssh_export do_ssh_export_clear
-    do_ssh_export SERVICE_USER_HOST _remote_dir
+    do_ssh_export SERVICE_USER_HOST _remote_dir _DEPLOY_SAME_HOST
     do_ssh_jumper_invoke deploy_env_do "${_local_dir}" "${_remote_dir}"
     local _status="${?}"
     set -e
@@ -1335,19 +1487,20 @@ define_common_deploy_env() {
   deploy_env_down_server_do() {
     local _remote_dir="${1}"
     local _service_group_lower
-    local _service_group_lower
     _service_group_lower="$(echo "${SERVICE_GROUP}" | tr '[:upper:]' '[:lower:]' | tr '-' '_')"
     set +e
     do_ssh_export_clear
     for i in "${DEPLOY_ENV_HOOK_EXPORT[@]}"; do do_ssh_export "${i}"; done
     do_ssh_export do_print_trace do_print_info do_print_warn do_print_colorful do_func_invoke
-    do_ssh_export do_file_replace do_diff
+    do_ssh_export do_sed_i do_file_replace do_diff
     do_ssh_export deploy_env_reset_do deploy_env_diff_do deploy_env_replace_do deploy_env_backup_do
     do_ssh_export CUSTOMER ENV_NAME CONTAINER_WORK_DIR _remote_dir _service_group_lower
-    do_ssh_export DEPLOY_HOST_ETH
+    [ -n "${DEPLOY_HOST_ETH}" ] && do_ssh_export DEPLOY_HOST_ETH
     do_ssh_export SERVICE_GROUP SERVICE_GROUP_DIR ENV_DEPLOY_DIR
     init_service_vault_do
-    do_ssh_export SERVICE_VAULT_USER SERVICE_VAULT_PASS SERVICE_VAULT_URL SERVICE_VAULT_PATH
+    for i in SERVICE_VAULT_USER SERVICE_VAULT_PASS SERVICE_VAULT_URL SERVICE_VAULT_PATH; do
+      [ -n "${!i}" ] && do_ssh_export "${i}"
+    done
     local _func_name="deploy_env_hook_do"
     if [ "$(type -t "${_func_name}")" = 'function' ]; then
       do_ssh_export "${_func_name}"
@@ -1393,6 +1546,7 @@ define_common_deploy_env() {
     local _cp="cp -p -f"
     if [ 'yes' = "${_is_first}" ]; then
       do_print_trace "# ${FUNCNAME[0]}: first deployment"
+      ${_compose_cmd} down 2>/dev/null || true
       ${_cp} "${_compose_yml_new:?}" "${_compose_yml_old:?}"
       [ -f "${_compose_env_new:?}" ] && ${_cp} "${_compose_env_new:?}" "${_compose_env_old:?}"
       return
@@ -1429,13 +1583,25 @@ define_common_deploy_env() {
     declare -rx DEPLOY_CUSTOMER="${CUSTOMER}"
     declare -x DEPLOY_HOST_IP='127.0.0.1'
     local _eth="${DEPLOY_HOST_ETH:-eth0}"
-    DEPLOY_HOST_IP=$(/usr/sbin/ifconfig "${_eth}" | grep 'inet ' | awk '{print $2}')
+    set +e +o pipefail
+    local _ip_output
+    if command -v ip &>/dev/null; then
+      _ip_output="$(ip -4 addr show "${_eth}" 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1)"
+    else
+      local _ifconfig
+      if [ -x /sbin/ifconfig ]; then _ifconfig=/sbin/ifconfig
+      else _ifconfig=/usr/sbin/ifconfig; fi
+      _ip_output="$(${_ifconfig} "${_eth}" 2>/dev/null | awk '/inet / {print $2}')"
+    fi
+    set -eo pipefail
+    [ -n "${_ip_output}" ] && DEPLOY_HOST_IP="${_ip_output}"
+    do_print_trace "DEPLOY_HOST_IP=${DEPLOY_HOST_IP} (eth=${_eth})"
     do_file_replace "${_path:?}" CONTAINER_WORK_DIR DEPLOY_CUSTOMER DEPLOY_HOST_IP DEPLOY_ENV_NAME
-    sed -i -e "s|#DEPLOY_HOST_USER|$(whoami)|g" "${_path}"
-    sed -i -e "s|#VAULT_USER|${SERVICE_VAULT_USER}|g" "${_path}"
-    sed -i -e "s|#VAULT_PASS|${SERVICE_VAULT_PASS}|g" "${_path}"
-    sed -i -e "s|#VAULT_URL|${SERVICE_VAULT_URL}|g" "${_path}"
-    sed -i -e "s|#VAULT_PATH|${SERVICE_VAULT_PATH}|g" "${_path}"
+    do_sed_i -e "s|#DEPLOY_HOST_USER|$(whoami)|g" "${_path}"
+    do_sed_i -e "s|#VAULT_USER|${SERVICE_VAULT_USER}|g" "${_path}"
+    do_sed_i -e "s|#VAULT_PASS|${SERVICE_VAULT_PASS}|g" "${_path}"
+    do_sed_i -e "s|#VAULT_URL|${SERVICE_VAULT_URL}|g" "${_path}"
+    do_sed_i -e "s|#VAULT_PATH|${SERVICE_VAULT_PATH}|g" "${_path}"
   }
   deploy_env_backup_do() {
     do_print_trace "# ${FUNCNAME[0]}"
@@ -1494,6 +1660,115 @@ define_common_ci_job() {
     do_print_section 'VERIFY JOB DONE!' && echo ''
   }
 } # define_common_job
+
+declare -ax CONTAINER_MULTILINE_VARS=()
+declare -ax CONTAINER_EXTRA_VOLUMES=()
+declare -ax CONTAINER_EXTRA_OPTIONS=()
+
+define_util_container() {
+  # Collect environment variables into a docker --env-file.
+  # Multiline values are recorded in CONTAINER_MULTILINE_VARS for passing via -e.
+  # Usage: do_container_generate_env_file <env_file> <container_project_dir> <env_source_file>
+  do_container_generate_env_file() {
+    local _env_file="${1:?}"
+    local _container_project_dir="${2:?}"
+    local _env_source="${3:?}"
+
+    : > "${_env_file}"
+
+    # Override CI_PROJECT_DIR to container path
+    echo "CI_PROJECT_DIR=${_container_project_dir}" >> "${_env_file}"
+
+    # Collect variable names from the user's .env file
+    local _var_names=()
+    while IFS= read -r line; do
+      [[ "${line}" =~ ^[[:space:]]*# ]] && continue
+      [[ -z "${line}" ]] && continue
+      line="${line#export }"
+      local _name="${line%%=*}"
+      [[ -z "${_name}" || "${_name}" =~ [[:space:]] ]] && continue
+      _var_names+=("${_name}")
+    done < "${_env_source}"
+
+    # Auto-detect all CI_* variables from current environment
+    local _ci_var
+    while IFS= read -r _ci_var; do
+      _var_names+=("${_ci_var}")
+    done < <(compgen -v CI_ 2>/dev/null || true)
+
+    # Write vars to env-file, skip CI_PROJECT_DIR (already written)
+    # and multiline values (they'll be passed via -e)
+    CONTAINER_MULTILINE_VARS=()
+    for _name in "${_var_names[@]}"; do
+      [[ "${_name}" == "CI_PROJECT_DIR" ]] && continue
+      local _value="${!_name:-}"
+      [[ -z "${_value}" ]] && continue
+
+      if [[ "${_value}" == *$'\n'* ]]; then
+        CONTAINER_MULTILINE_VARS+=("${_name}")
+      else
+        echo "${_name}=${_value}" >> "${_env_file}"
+      fi
+    done
+  }
+
+  # Run a script inside a Docker container via stdin pipe.
+  # Returns the container exit code directly.
+  #
+  # Required globals:
+  #   CONTAINER_ENV_FILE       — path to docker --env-file
+  #   CONTAINER_PROJECT_DIR    — container-internal project directory
+  #   CONTAINER_SOURCE_DIR     — host project directory to mount
+  #
+  # Optional globals:
+  #   CONTAINER_MULTILINE_VARS — array of multiline var names for -e flags
+  #   CONTAINER_EXTRA_VOLUMES  — array of extra -v expressions
+  #   CONTAINER_EXTRA_OPTIONS  — array of extra docker run options
+  #
+  # Usage: do_container_run <image> <stage_name> <script_string>
+  do_container_run() {
+    local _image="${1:?}"
+    local _stage="${2:?}"
+    local _script="${3:?}"
+
+    local _cmd=(docker run --rm -i)
+
+    # Environment file
+    _cmd+=(--env-file "${CONTAINER_ENV_FILE:?}")
+
+    # Pass multiline variables via -e (docker inherits from host env)
+    for _name in "${CONTAINER_MULTILINE_VARS[@]}"; do
+      _cmd+=(-e "${_name}")
+    done
+
+    # Extra options
+    for _opt in "${CONTAINER_EXTRA_OPTIONS[@]}"; do
+      _cmd+=("${_opt}")
+    done
+
+    # Volume: project source
+    _cmd+=(-v "${CONTAINER_SOURCE_DIR:?}:${CONTAINER_PROJECT_DIR:?}")
+
+    # Extra volumes
+    for _vol in "${CONTAINER_EXTRA_VOLUMES[@]}"; do
+      _cmd+=(-v "${_vol}")
+    done
+
+    # Working directory
+    _cmd+=(-w "${CONTAINER_PROJECT_DIR}")
+
+    # Image and shell
+    _cmd+=("${_image}" bash -eo pipefail -s)
+
+    echo "${_script}" | "${_cmd[@]}"
+  }
+
+  # Add a volume mount to CONTAINER_EXTRA_VOLUMES
+  # Usage: do_container_add_volume <volume_expr>
+  do_container_add_volume() {
+    CONTAINER_EXTRA_VOLUMES+=("${1:?}")
+  }
+}
 
 #===============================================================================
 # end of file: .gitlab-ci.lib.sh

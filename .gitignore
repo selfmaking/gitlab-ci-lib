@@ -1,6 +1,14 @@
 /temp.*
 /test/temp*
 
+### Local config (contains secrets)
+.env.local
+.env.*.local
+.env.develop
+.env.testing
+.env.staging
+.env.production
+
 ### JetBrains
 .idea/*
 
@@ -12,3 +20,5 @@
 !.vscode/extensions.json
 *.code-workspace
 .history/
+.claude
+.DS_Store

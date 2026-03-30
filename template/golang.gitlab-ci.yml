@@ -43,9 +43,14 @@ stages: [ first, build, deploy, verify, final ]
       if: $CI_COMMIT_BRANCH == 'main' || $CI_COMMIT_BRANCH == 'master'
 
 .common_layer_functions:
+#  - &init_common_func |
+#    [[ -f "${CI_PROJECT_DIR:?}/.gitlab-ci.lib.sh" ]] && {
+#    . "${CI_PROJECT_DIR}/.gitlab-ci.lib.sh" ;
+#    echo "Sourced with exit code: ${?}"
+#    } ; pwd ;
   - &init_common_func |
-    SELF_LIB_VERSION="${GITLAB_CI_LIB_VERSION:-release/1.6}";
-    SELF_LIB_URL="${SELF_LIB_URL:=https://gitlab.com/wangkang/gitlab-ci-lib/-/raw/${SELF_LIB_VERSION:?}/.gitlab-ci.lib.sh}";
+    SELF_LIB_VERSION="${GITLAB_CI_LIB_VERSION:-custom/zxq}";
+    SELF_LIB_URL="${SELF_LIB_URL:=https://github.com/selfmaking/gitlab-ci-lib/blob/${SELF_LIB_VERSION:?}/.gitlab-ci.lib.sh}";
     echo 'SELF_LIB_URL' "${SELF_LIB_URL}";
     . <(curl -s "${SELF_LIB_URL}");
     define_common_init
