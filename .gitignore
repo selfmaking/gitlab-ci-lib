@@ -3,7 +3,6 @@
 
 ### Local config (contains secrets)
 .env.local
-.env.*.local
 .env.develop
 .env.testing
 .env.staging

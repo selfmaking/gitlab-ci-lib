@@ -50,7 +50,7 @@ stages: [ first, build, deploy, verify, final ]
 #    } ; pwd ;
   - &init_common_func |
     SELF_LIB_VERSION="${GITLAB_CI_LIB_VERSION:-custom/zxq}";
-    SELF_LIB_URL="${SELF_LIB_URL:=https://github.com/selfmaking/gitlab-ci-lib/blob/${SELF_LIB_VERSION:?}/.gitlab-ci.lib.sh}";
+    SELF_LIB_URL="${SELF_LIB_URL:=https://raw.githubusercontent.com/selfmaking/gitlab-ci-lib/${GITLAB_CI_LIB_VERSION:?}/.gitlab-ci.lib.sh}";
     echo 'SELF_LIB_URL' "${SELF_LIB_URL}";
     . <(curl -s "${SELF_LIB_URL}");
     define_common_init
